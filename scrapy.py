@@ -31,15 +31,31 @@ def kill_child_processes(parent_pid, sig=signal.SIGTERM):
 #Get all the blackhat speech sessions
 def get_All_Sessions(Area_With_Date):
     TopicURL = []
-    url = ("https://www.blackhat.com/%s/briefings/schedule/index.html"%Area_With_Date)
+
+    url = f"https://www.blackhat.com/{Area_With_Date}/briefings/schedule/index.html"
+
     response = asyncio.get_event_loop().run_until_complete(main([url]))
-    soup = BeautifulSoup(response[0],'lxml')
-    main_li = soup.find('ul', id="cal_content_Day").find_all('li')
-    for i in main_li:
-        a = i.find_all('a',attrs={'href':re.compile('#')})
-        for x in a:
-            if "speakers" not in x['href']:
-                TopicURL.append("https://www.blackhat.com/%s/briefings/schedule/"%Area_With_Date + x['href'])
+    soup = BeautifulSoup(response[0], "lxml")
+
+    # 不再依赖旧版的 ul#cal_content_Day
+    links = soup.find_all("a", href=True)
+
+    for link in links:
+        href = link.get("href", "").strip()
+
+        # Black Hat session 使用 #session-name-12345 形式
+        if (
+            href.startswith("#")
+            and href != "#"
+            and "speakers" not in href.lower()
+            and re.search(r"-\d+$", href)
+        ):
+            TopicURL.append(url + href)
+
+    TopicURL = list(set(TopicURL))
+
+    print(f"Found {len(TopicURL)} sessions")
+
     return TopicURL
         
 
