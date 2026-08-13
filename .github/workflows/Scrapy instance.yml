@@ -3,40 +3,64 @@ name: Run Scrapy
 on:
   push:
     branches: [ main ]
+
   pull_request:
     branches: [ main ]
+
   workflow_dispatch:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v7
-    
-    - name: Set up Python 3.11
-      uses: actions/setup-python@v6
-      with:
-        python-version: 3.11
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        sudo apt update && sudo apt install wget
-        
-    - name: Create save folder
-      run: mkdir ${{ github.workspace }}/save
-      
-    - name: Run with script
-      run: python scrapy.py
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-    - name: Tar files
-      run: tar -zcvf BlackHat-PDF.tar.gz -C ${{ github.workspace }} save/
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: "pip"
 
-    - name: Deliver pdf file
-      uses: actions/upload-artifact@v7
-      with:
-        name: BlackHat-PDF
-        path: BlackHat-PDF.tar.gz
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install --with-deps chromium
+
+      - name: Show target
+        run: |
+          echo "===== TARGET ====="
+          cat target.txt
+
+      - name: Run scraper
+        run: |
+          python scrapy.py
+
+      - name: Show downloaded files
+        if: always()
+        run: |
+          echo "===== SAVE ====="
+          find save -type f 2>/dev/null || true
+
+          echo "===== DEBUG ====="
+          find debug -type f 2>/dev/null || true
+
+      - name: Tar files
+        if: always()
+        run: |
+          tar -zcvf BlackHat-PDF.tar.gz save/ debug/ 2>/dev/null || \
+          tar -zcvf BlackHat-PDF.tar.gz save/
+
+      - name: Deliver PDF files
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: BlackHat-PDF
+          path: BlackHat-PDF.tar.gz
+          if-no-files-found: warn
+          retention-days: 30
