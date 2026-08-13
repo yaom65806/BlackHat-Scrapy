@@ -1,56 +1,54 @@
 import asyncio
-import re
-import signal
-import psutil
 import os
+import re
 import subprocess
-from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit, quote
+
 from pyppeteer import launch
 from bs4 import BeautifulSoup
 from multiprocessing.pool import ThreadPool
 
 
 # ============================================================
-# 配置
+# Configuration
 # ============================================================
 
 TARGET_FILE = "target.txt"
 
-# 页面加载超时
 PAGE_TIMEOUT = 60000
 
-# 页面加载后额外等待
-PAGE_WAIT = 5
+# 页面打开后等待 JS 更新 hash/modal
+PAGE_WAIT = 1.2
+
+# 下载 PDF 并发数
+DOWNLOAD_THREADS = 10
 
 
 # ============================================================
-# 读取 target.txt
+# Read target.txt
 # ============================================================
 
-def load_targets():
+def load_targets(filename=TARGET_FILE):
     """
-    target.txt 可以写：
-
-    US-26
-
-    或者：
+    target.txt 示例：
 
     US-26
     US-25
     ASIA-26
     ASIA-25
+
+    支持空行以及 # 注释。
     """
 
-    if not os.path.exists(TARGET_FILE):
+    if not os.path.exists(filename):
         raise FileNotFoundError(
-            f"找不到 {TARGET_FILE}"
+            f"找不到 {filename}"
         )
 
     targets = []
 
     with open(
-        TARGET_FILE,
+        filename,
         "r",
         encoding="utf-8"
     ) as f:
@@ -70,18 +68,18 @@ def load_targets():
                 line
             ):
                 print(
-                    f"[WARN] 无效 target: {line}"
+                    f"[WARN] Invalid target: {line}"
                 )
-
                 continue
 
             targets.append(line)
 
+    # 去重并保持顺序
     return list(dict.fromkeys(targets))
 
 
 # ============================================================
-# 查找系统 Chrome
+# Find Chrome
 # ============================================================
 
 def find_chrome():
@@ -112,185 +110,65 @@ def find_chrome():
 
 
 # ============================================================
-# 页面访问
+# Browser
 # ============================================================
 
-async def goto_page(
-    page,
-    url,
-    retry=3
-):
-
-    for attempt in range(
-        1,
-        retry + 1
-    ):
-
-        print(
-            f"[PAGE] {url} "
-            f"(attempt {attempt}/{retry})"
-        )
-
-        try:
-
-            response = await page.goto(
-                url,
-                {
-                    "waitUntil": "networkidle2",
-                    "timeout": PAGE_TIMEOUT,
-                }
-            )
-
-            status = (
-                response.status
-                if response
-                else None
-            )
-
-            print(
-                f"[HTTP] {status} -> {page.url}"
-            )
-
-            # ----------------------------
-            # 成功
-            # ----------------------------
-
-            if status and status < 400:
-
-                await asyncio.sleep(
-                    PAGE_WAIT
-                )
-
-                # 页面滚动，触发懒加载
-                try:
-
-                    await page.evaluate(
-                        """
-                        () => {
-                            window.scrollTo(
-                                0,
-                                document.body.scrollHeight
-                            );
-                        }
-                        """
-                    )
-
-                    await asyncio.sleep(2)
-
-                    await page.evaluate(
-                        """
-                        () => {
-                            window.scrollTo(0, 0);
-                        }
-                        """
-                    )
-
-                except:
-                    pass
-
-                return True
-
-            # ----------------------------
-            # 403
-            # ----------------------------
-
-            if status == 403:
-
-                print(
-                    "[WARN] HTTP 403, "
-                    "retrying..."
-                )
-
-                await asyncio.sleep(
-                    3 * attempt
-                )
-
-                continue
-
-            print(
-                f"[WARN] HTTP status: {status}"
-            )
-
-        except Exception as e:
-
-            print(
-                f"[WARN] page.goto failed: {e}"
-            )
-
-            await asyncio.sleep(
-                3 * attempt
-            )
-
-    return False
-
-
-# ============================================================
-# 原来的 main()
-# ============================================================
-
-async def main(target):
-
-    _return = []
+async def create_browser():
 
     chrome_path = find_chrome()
 
-    launch_args = {
-
+    kwargs = {
         "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-default-apps",
+            "--disable-extensions",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--window-size=1920,1080",
+        ],
 
-        "options": {
+        # 不把 Chrome DBus 日志刷到 GitHub Actions
+        "dumpio": False,
 
-            "args": [
+        "autoClose": True,
 
-                "--no-sandbox",
-
-                "--disable-setuid-sandbox",
-
-                "--disable-dev-shm-usage",
-
-                "--disable-gpu",
-
-                "--disable-blink-features=AutomationControlled",
-
-                "--window-size=1920,1080",
-
-            ],
-
-            "dumpio": True,
-
-            "autoClose": False,
-        }
+        "ignoreHTTPSErrors": True,
     }
 
-    # 优先使用 GitHub runner 已安装的 Chrome
     if chrome_path:
-
-        launch_args[
-            "executablePath"
-        ] = chrome_path
+        kwargs["executablePath"] = chrome_path
 
     browser = await launch(
-        **launch_args
+        **kwargs
     )
+
+    return browser
+
+
+# ============================================================
+# Configure page
+# ============================================================
+
+async def setup_page(browser):
 
     page = await browser.newPage()
 
-    # ========================================================
-    # 使用浏览器自己的 UA
-    # 只去掉 HeadlessChrome
-    # ========================================================
-
+    # 使用系统 Chrome 自己的 UA
     try:
 
-        user_agent = (
-            await browser.userAgent()
-        )
+        user_agent = await browser.userAgent()
 
-        user_agent = (
-            user_agent.replace(
-                "HeadlessChrome",
-                "Chrome"
-            )
+        user_agent = user_agent.replace(
+            "HeadlessChrome",
+            "Chrome"
         )
 
         await page.setUserAgent(
@@ -304,12 +182,8 @@ async def main(target):
     except Exception as e:
 
         print(
-            f"[WARN] UA setup failed: {e}"
+            f"[WARN] Unable to set UA: {e}"
         )
-
-    # ========================================================
-    # 浏览器环境
-    # ========================================================
 
     await page.setViewport({
         "width": 1920,
@@ -318,56 +192,60 @@ async def main(target):
     })
 
     await page.setExtraHTTPHeaders({
-
-        "Accept-Language":
-            "en-US,en;q=0.9",
-
-        "DNT":
-            "1",
+        "Accept-Language": "en-US,en;q=0.9",
+        "DNT": "1",
     })
-
-    # 避免 webdriver 标识
-    await page.evaluateOnNewDocument(
-        """
-        () => {
-
-            Object.defineProperty(
-                navigator,
-                'webdriver',
-                {
-                    get: () => undefined
-                }
-            );
-
-        }
-        """
-    )
-
-    # ========================================================
-    # 先访问主页
-    #
-    # 原爬取逻辑没有改变。
-    # 这里主要是先建立正常 Cookie / 浏览器会话。
-    # ========================================================
 
     try:
 
-        print(
-            "[INFO] Warming up blackhat.com..."
+        await page.evaluateOnNewDocument(
+            """
+            () => {
+                Object.defineProperty(
+                    navigator,
+                    'webdriver',
+                    {
+                        get: () => undefined
+                    }
+                );
+            }
+            """
         )
 
-        await page.goto(
+    except Exception:
+        pass
+
+    return page
+
+
+# ============================================================
+# Warm up
+# ============================================================
+
+async def warm_up(page):
+
+    print(
+        "[INFO] Warming up blackhat.com..."
+    )
+
+    try:
+
+        response = await page.goto(
             "https://blackhat.com/",
             {
-                "waitUntil":
-                    "domcontentloaded",
-
-                "timeout":
-                    PAGE_TIMEOUT,
+                "waitUntil": "domcontentloaded",
+                "timeout": PAGE_TIMEOUT,
             }
         )
 
-        await asyncio.sleep(3)
+        if response:
+
+            print(
+                f"[INFO] Warm-up HTTP: "
+                f"{response.status}"
+            )
+
+        await asyncio.sleep(2)
 
     except Exception as e:
 
@@ -375,86 +253,227 @@ async def main(target):
             f"[WARN] Warm-up failed: {e}"
         )
 
-    # ========================================================
-    # 原来的遍历 target URL
-    # ========================================================
-
-    for url in target:
-
-        success = await goto_page(
-            page,
-            url
-        )
-
-        if not success:
-
-            print(
-                f"[ERROR] Unable to load: {url}"
-            )
-
-            _return.append("")
-
-            continue
-
-        content = await page.content()
-
-        _return.append(
-            content
-        )
-
-    await browser.close()
-
-    return _return
-
 
 # ============================================================
-# 原来的 kill_child_processes()
+# Open page
 # ============================================================
 
-def kill_child_processes(
-    parent_pid,
-    sig=signal.SIGTERM
+async def goto_page(
+    page,
+    url,
+    retry=2
 ):
 
-    try:
-
-        parent = psutil.Process(
-            parent_pid
-        )
-
-    except psutil.NoSuchProcess:
-
-        return
-
-    children = parent.children(
-        recursive=True
-    )
-
-    for process in children:
+    for attempt in range(
+        1,
+        retry + 1
+    ):
 
         try:
 
-            process.send_signal(sig)
+            response = await page.goto(
+                url,
+                {
+                    "waitUntil": "domcontentloaded",
+                    "timeout": PAGE_TIMEOUT,
+                }
+            )
 
-        except:
+            # ==================================================
+            # 对于同一个 index.html 不同 #fragment，
+            # Chromium 有时认为是 same-document navigation，
+            # response 会返回 None。
+            #
+            # 这是正常现象，不能判断为失败。
+            # ==================================================
 
-            pass
+            if response is None:
+
+                print(
+                    f"[HTTP] same-document -> {page.url}"
+                )
+
+                await asyncio.sleep(
+                    PAGE_WAIT
+                )
+
+                return True
+
+            status = response.status
+
+            print(
+                f"[HTTP] {status} -> {page.url}"
+            )
+
+            if status < 400:
+
+                await asyncio.sleep(
+                    PAGE_WAIT
+                )
+
+                return True
+
+            if status == 403:
+
+                print(
+                    f"[WARN] HTTP 403 "
+                    f"(attempt {attempt}/{retry})"
+                )
+
+                await asyncio.sleep(
+                    3 * attempt
+                )
+
+                continue
+
+            print(
+                f"[WARN] HTTP {status}"
+            )
+
+        except Exception as e:
+
+            print(
+                f"[WARN] page.goto failed: {e}"
+            )
+
+            await asyncio.sleep(
+                2 * attempt
+            )
+
+    return False
 
 
 # ============================================================
-# 运行 async main
+# Get one/multiple pages with ONE Chrome
 # ============================================================
 
-def browser_get(url):
+async def fetch_pages_async(urls):
+
+    browser = await create_browser()
+
+    page = await setup_page(
+        browser
+    )
+
+    results = []
+
+    try:
+
+        # 一整个批次只 warm-up 一次
+        await warm_up(page)
+
+        total = len(urls)
+
+        for index, url in enumerate(
+            urls,
+            start=1
+        ):
+
+            print(
+                f"[PAGE {index}/{total}] {url}"
+            )
+
+            success = await goto_page(
+                page,
+                url
+            )
+
+            if not success:
+
+                print(
+                    f"[ERROR] Unable to load: {url}"
+                )
+
+                results.append("")
+
+                continue
+
+            try:
+
+                content = await page.content()
+
+                results.append(
+                    content
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[ERROR] Unable to get HTML: {e}"
+                )
+
+                results.append("")
+
+    finally:
+
+        await browser.close()
+
+    return results
+
+
+def browser_get(urls):
+
+    if isinstance(
+        urls,
+        str
+    ):
+        urls = [urls]
 
     return asyncio.run(
-        main([url])
+        fetch_pages_async(
+            urls
+        )
     )
 
 
 # ============================================================
-# 原逻辑：
-# Get all the blackhat speech sessions
+# URL encode
+# ============================================================
+
+def encode_url(url):
+    """
+    PDF 文件名可能有空格，例如：
+
+    Akash BlackHat Presentation 2026 - Final.pdf
+
+    wget 对裸空格 URL 可能有问题，
+    所以把 path 正确编码。
+    """
+
+    try:
+
+        parts = urlsplit(url)
+
+        encoded_path = quote(
+            parts.path,
+            safe="/%:@"
+        )
+
+        return urlunsplit(
+            (
+                parts.scheme,
+                parts.netloc,
+                encoded_path,
+                parts.query,
+                parts.fragment,
+            )
+        )
+
+    except Exception:
+
+        return url
+
+
+# ============================================================
+# Get all Black Hat sessions
+#
+# 保留原来的逻辑：
+#
+# schedule
+#   ↓
+# ul#cal_content_Day
+#   ↓
+# #session-name-ID
 # ============================================================
 
 def get_All_Sessions(
@@ -462,17 +481,6 @@ def get_All_Sessions(
 ):
 
     TopicURL = []
-
-    # --------------------------------------------
-    # 原来：
-    #
-    # https://www.blackhat.com/US-25/...
-    #
-    # 现在统一小写 + blackhat.com
-    #
-    # US-25 如果归档，
-    # 浏览器会自动跟随 redirect。
-    # --------------------------------------------
 
     url = (
         f"https://blackhat.com/"
@@ -482,7 +490,7 @@ def get_All_Sessions(
 
     print()
     print(
-        "=" * 60
+        "=" * 70
     )
 
     print(
@@ -494,7 +502,7 @@ def get_All_Sessions(
     )
 
     print(
-        "=" * 60
+        "=" * 70
     )
 
     response = browser_get(
@@ -507,8 +515,8 @@ def get_All_Sessions(
     ):
 
         print(
-            f"[ERROR] Unable to get schedule "
-            f"for {Area_With_Date}"
+            f"[ERROR] Unable to get schedule: "
+            f"{Area_With_Date}"
         )
 
         return []
@@ -521,9 +529,9 @@ def get_All_Sessions(
     )
 
     # ========================================================
-    # 第一种：
+    # 方法 1
     #
-    # 完全保留你原来的 DOM
+    # 完全使用原来的：
     # ul#cal_content_Day
     # ========================================================
 
@@ -543,17 +551,17 @@ def get_All_Sessions(
             "li"
         )
 
-        for i in main_li:
+        for li in main_li:
 
-            anchors = i.find_all(
+            anchors = li.find_all(
                 "a",
                 href=True
             )
 
-            for x in anchors:
+            for a in anchors:
 
                 href = (
-                    x.get(
+                    a.get(
                         "href",
                         ""
                     )
@@ -561,33 +569,37 @@ def get_All_Sessions(
                 )
 
                 if not href:
-
                     continue
 
-                if (
-                    href.startswith("#")
-                    and
-                    "speakers"
-                    not in href.lower()
-                ):
+                if not href.startswith("#"):
+                    continue
 
-                    TopicURL.append(
-                        url + href
-                    )
+                if "speaker" in href.lower():
+                    continue
+
+                # Black Hat session 基本都有数字 ID
+                if not re.search(
+                    r"-\d+$",
+                    href
+                ):
+                    continue
+
+                TopicURL.append(
+                    url + href
+                )
 
     # ========================================================
-    # 第二种：
+    # 方法 2
     #
-    # DOM class/id 变化时，
-    # 仍然按照原来的 "#session-xxxxx-ID"
-    # 原理找 session。
+    # ul 名字以后改变时：
+    # 仍然按照 #session-name-ID 原理找
     # ========================================================
 
     if not TopicURL:
 
         print(
-            "[INFO] Old schedule DOM not found, "
-            "searching session anchors..."
+            "[INFO] ul#cal_content_Day "
+            "not found, scanning anchors..."
         )
 
         anchors = soup.find_all(
@@ -606,36 +618,28 @@ def get_All_Sessions(
             )
 
             if not href:
-
                 continue
 
-            # ----------------------------------------
-            # 原 Black Hat session 格式：
-            #
-            # #apple-storm-xxxxx-12345
-            # ----------------------------------------
+            if not href.startswith("#"):
+                continue
 
-            if (
-                href.startswith("#")
-                and
-                "speaker"
-                not in href.lower()
-                and
-                re.search(
-                    r"-\d+$",
-                    href
-                )
+            if "speaker" in href.lower():
+                continue
+
+            if not re.search(
+                r"-\d+$",
+                href
             ):
+                continue
 
-                TopicURL.append(
-                    url + href
-                )
+            TopicURL.append(
+                url + href
+            )
 
     # ========================================================
-    # 第三种：
+    # 方法 3
     #
-    # 有些 session 链接藏在 HTML / JS 内容里面，
-    # 但还是原来的 #xxxx-ID 结构。
+    # 再 fallback 到 raw HTML
     # ========================================================
 
     if not TopicURL:
@@ -654,14 +658,15 @@ def get_All_Sessions(
 
             if (
                 "speaker"
-                not in fragment.lower()
+                in fragment.lower()
             ):
+                continue
 
-                TopicURL.append(
-                    url + fragment
-                )
+            TopicURL.append(
+                url + fragment
+            )
 
-    # 去重
+    # 去重保持顺序
     TopicURL = list(
         dict.fromkeys(
             TopicURL
@@ -677,8 +682,248 @@ def get_All_Sessions(
 
 
 # ============================================================
-# 原逻辑：
-# Sort all the pdf file link
+# Extract PDF from one session HTML
+#
+# 保留原来的：
+#
+# div.bhpresentation
+#        ↓
+#     <a href>
+#        ↓
+#      .pdf
+# ============================================================
+
+def extract_session_pdfs(
+    html,
+    session_url
+):
+
+    soup = BeautifulSoup(
+        html,
+        "lxml"
+    )
+
+    session_pdfs = []
+
+    # ========================================================
+    # 第一优先：
+    # 原来的 bhpresentation
+    # ========================================================
+
+    div = soup.find(
+        "div",
+        class_="bhpresentation"
+    )
+
+    if div:
+
+        links = div.find_all(
+            "a",
+            href=True
+        )
+
+        for a in links:
+
+            href = (
+                a.get(
+                    "href",
+                    ""
+                )
+                .strip()
+            )
+
+            if not href:
+                continue
+
+            if ".pdf" not in href.lower():
+                continue
+
+            full_url = urljoin(
+                session_url,
+                href
+            )
+
+            session_pdfs.append(
+                encode_url(
+                    full_url
+                )
+            )
+
+    # ========================================================
+    # fallback
+    #
+    # 新页面如果 bhpresentation class 改名，
+    # 从当前 session HTML 里找 Presentation PDF。
+    #
+    # 注意：
+    # 必须带 /Presentations/
+    #
+    # 防止误抓：
+    # /Trainings/BHUSA26_Trainings...
+    # ========================================================
+
+    if not session_pdfs:
+
+        pdf_links = soup.find_all(
+            "a",
+            href=True
+        )
+
+        for a in pdf_links:
+
+            href = (
+                a.get(
+                    "href",
+                    ""
+                )
+                .strip()
+            )
+
+            if not href:
+                continue
+
+            lower_href = href.lower()
+
+            clean_href = (
+                lower_href
+                .split("?")[0]
+            )
+
+            if not clean_href.endswith(
+                ".pdf"
+            ):
+                continue
+
+            full_url = urljoin(
+                session_url,
+                href
+            )
+
+            # fallback 只取 Presentation
+            if (
+                "/presentations/"
+                not in full_url.lower()
+            ):
+                continue
+
+            session_pdfs.append(
+                encode_url(
+                    full_url
+                )
+            )
+
+    return list(
+        dict.fromkeys(
+            session_pdfs
+        )
+    )
+
+
+# ============================================================
+# Process ALL sessions using ONE Chrome
+# ============================================================
+
+async def process_sessions_async(
+    TopicURL
+):
+
+    All_PDF = []
+
+    if not TopicURL:
+        return []
+
+    browser = await create_browser()
+
+    page = await setup_page(
+        browser
+    )
+
+    try:
+
+        # 整个 124 sessions 只 warm-up 一次
+        await warm_up(page)
+
+        total = len(TopicURL)
+
+        print()
+        print(
+            f"[INFO] Processing "
+            f"{total} sessions"
+        )
+
+        for index, url in enumerate(
+            TopicURL,
+            start=1
+        ):
+
+            print()
+            print(
+                f"[SESSION {index}/{total}]"
+            )
+
+            print(url)
+
+            success = await goto_page(
+                page,
+                url
+            )
+
+            if not success:
+
+                print(
+                    "[WARN] Session page failed"
+                )
+
+                continue
+
+            try:
+
+                html = await page.content()
+
+            except Exception as e:
+
+                print(
+                    f"[WARN] Unable to get HTML: "
+                    f"{e}"
+                )
+
+                continue
+
+            session_pdfs = (
+                extract_session_pdfs(
+                    html,
+                    url
+                )
+            )
+
+            print(
+                f"[INFO] PDF found: "
+                f"{len(session_pdfs)}"
+            )
+
+            for pdf in session_pdfs:
+
+                print(
+                    f"       {pdf}"
+                )
+
+                All_PDF.append(
+                    pdf
+                )
+
+    finally:
+
+        await browser.close()
+
+    return list(
+        dict.fromkeys(
+            All_PDF
+        )
+    )
+
+
+# ============================================================
+# Sort PDFs
 # ============================================================
 
 def sort_PDF(
@@ -689,164 +934,49 @@ def sort_PDF(
         Area_With_Date
     )
 
-    All_PDF = []
-
-    print(
-        f"[INFO] Processing "
-        f"{len(TopicURL)} sessions"
-    )
-
-    for index, url in enumerate(
-        TopicURL,
-        start=1
-    ):
-
-        print()
-        print(
-            f"[SESSION "
-            f"{index}/"
-            f"{len(TopicURL)}]"
-        )
-
-        print(url)
-
-        # 原来的 cleanup 保留
-        kill_child_processes(
-            os.getpid()
-        )
-
-        response = browser_get(
-            url
-        )
-
-        if (
-            not response
-            or not response[0]
-        ):
-
-            print(
-                "[WARN] Session page empty"
-            )
-
-            continue
-
-        soup = BeautifulSoup(
-            response[0],
-            "lxml"
-        )
-
-        # ====================================================
-        # 第一优先：
-        # 完全保留你原来的 bhpresentation
-        # ====================================================
-
-        div = soup.find(
-            "div",
-            class_="bhpresentation"
-        )
-
-        session_pdfs = []
-
-        if div:
-
-            main_div = div.find_all(
-                "a",
-                href=True
-            )
-
-            for a in main_div:
-
-                href = (
-                    a.get(
-                        "href",
-                        ""
-                    )
-                    .strip()
-                )
-
-                if (
-                    ".pdf"
-                    in href.lower()
-                ):
-
-                    href = urljoin(
-                        url,
-                        href
-                    )
-
-                    session_pdfs.append(
-                        href
-                    )
-
-        # ====================================================
-        # bhpresentation 名字变化时
-        #
-        # 仍然是在当前 session 页面找 PDF，
-        # 爬虫流程没有改变。
-        # ====================================================
-
-        if not session_pdfs:
-
-            pdf_links = soup.find_all(
-                "a",
-                href=re.compile(
-                    r"\.pdf(?:\?|$)",
-                    re.I
-                )
-            )
-
-            for a in pdf_links:
-
-                href = (
-                    a.get(
-                        "href",
-                        ""
-                    )
-                    .strip()
-                )
-
-                if href:
-
-                    href = urljoin(
-                        url,
-                        href
-                    )
-
-                    session_pdfs.append(
-                        href
-                    )
-
-        session_pdfs = list(
-            dict.fromkeys(
-                session_pdfs
-            )
-        )
+    if not TopicURL:
 
         print(
-            f"[INFO] PDF found: "
-            f"{len(session_pdfs)}"
+            f"[WARN] No sessions found "
+            f"for {Area_With_Date}"
         )
 
-        for pdf in session_pdfs:
+        return []
 
-            print(
-                f"       {pdf}"
-            )
+    # ========================================================
+    # 关键修改
+    #
+    # 原来：
+    #
+    # for session:
+    #     开一个 Chrome
+    #
+    # 现在：
+    #
+    # 开一个 Chrome
+    #     ↓
+    # session 1
+    # session 2
+    # session 3
+    # ...
+    # session 124
+    #     ↓
+    # 关闭 Chrome
+    # ========================================================
 
-            All_PDF.append(
-                pdf
-            )
-
-    return list(
-        dict.fromkeys(
-            All_PDF
+    All_PDF = asyncio.run(
+        process_sessions_async(
+            TopicURL
         )
     )
+
+    return All_PDF
 
 
 # ============================================================
-# 原逻辑：
-# wget 下载
+# Download PDF
+#
+# 保留原来的 wget 下载逻辑
 # ============================================================
 
 def download_PDF(args):
@@ -870,7 +1000,7 @@ def download_PDF(args):
         f"[DOWNLOAD] {PDF}"
     )
 
-    subprocess.call(
+    result = subprocess.call(
         [
             "wget",
 
@@ -893,6 +1023,15 @@ def download_PDF(args):
         cwd=currentDir
     )
 
+    if result != 0:
+
+        print(
+            f"[WARN] wget failed: "
+            f"{PDF}"
+        )
+
+    return result
+
 
 # ============================================================
 # MAIN
@@ -914,10 +1053,35 @@ if __name__ == "__main__":
 
     Targets = load_targets()
 
+    if not Targets:
+
+        print(
+            "[ERROR] No valid targets "
+            "found in target.txt"
+        )
+
+        raise SystemExit(1)
+
     print(
         "[INFO] Targets: "
         + ", ".join(Targets)
     )
+
+    os.makedirs(
+        "save",
+        exist_ok=True
+    )
+
+    total_pdf_count = 0
+
+    # ========================================================
+    # 每一个 target：
+    #
+    # 1. schedule
+    # 2. sessions
+    # 3. PDF
+    # 4. wget
+    # ========================================================
 
     for Area_With_Date in Targets:
 
@@ -927,21 +1091,48 @@ if __name__ == "__main__":
         )
 
         print(
-            f"# START: {Area_With_Date}"
+            f"# START: "
+            f"{Area_With_Date}"
         )
 
         print(
             "#" * 70
         )
 
-        All_pdf = sort_PDF(
-            Area_With_Date
-        )
+        try:
+
+            All_pdf = sort_PDF(
+                Area_With_Date
+            )
+
+        except Exception as e:
+
+            print()
+            print(
+                f"[ERROR] "
+                f"{Area_With_Date} failed:"
+            )
+
+            print(
+                f"        {e}"
+            )
+
+            continue
 
         print()
         print(
-            f"[RESULT] {Area_With_Date}: "
-            f"{len(All_pdf)} PDF files"
+            "=" * 70
+        )
+
+        print(
+            f"[RESULT] "
+            f"{Area_With_Date}: "
+            f"{len(All_pdf)} "
+            f"unique PDF files"
+        )
+
+        print(
+            "=" * 70
         )
 
         if not All_pdf:
@@ -953,24 +1144,76 @@ if __name__ == "__main__":
 
             continue
 
-        tp = ThreadPool(30)
+        # 保存 URL 清单
+        target_dir = os.path.join(
+            "save",
+            Area_With_Date
+        )
+
+        os.makedirs(
+            target_dir,
+            exist_ok=True
+        )
+
+        url_file = os.path.join(
+            target_dir,
+            "pdf_urls.txt"
+        )
+
+        with open(
+            url_file,
+            "w",
+            encoding="utf-8"
+        ) as f:
+
+            for pdf in All_pdf:
+
+                f.write(
+                    pdf + "\n"
+                )
+
+        total_pdf_count += len(
+            All_pdf
+        )
+
+        # ====================================================
+        # wget 并发下载
+        # ====================================================
 
         jobs = [
             (
                 Area_With_Date,
                 pdf
             )
+
             for pdf in All_pdf
         ]
 
-        tp.map(
-            download_PDF,
-            jobs
+        tp = ThreadPool(
+            DOWNLOAD_THREADS
         )
 
-        tp.close()
+        try:
 
-        tp.join()
+            tp.map(
+                download_PDF,
+                jobs
+            )
+
+        finally:
+
+            tp.close()
+            tp.join()
+
+        print()
+        print(
+            f"[DONE] "
+            f"{Area_With_Date}"
+        )
+
+    # ========================================================
+    # FINAL
+    # ========================================================
 
     print()
     print(
@@ -978,9 +1221,23 @@ if __name__ == "__main__":
     )
 
     print(
-        "DONE"
+        "ALL TARGETS FINISHED"
+    )
+
+    print(
+        f"Total unique PDFs: "
+        f"{total_pdf_count}"
     )
 
     print(
         "=" * 70
     )
+
+    if total_pdf_count == 0:
+
+        print(
+            "[ERROR] No PDF found "
+            "for any target"
+        )
+
+        raise SystemExit(1)
