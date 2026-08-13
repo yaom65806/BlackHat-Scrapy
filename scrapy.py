@@ -45,7 +45,7 @@ def get_All_Sessions(Area_With_Date):
 
 #Sort all the pdf file link
 def sort_PDF():
-    TopicURL = get_All_Sessions(Area_With_Date="US-26")
+    TopicURL = get_All_Sessions(Area_With_Date="US-25")
     All_PDF=[]
     for url in TopicURL:
         kill_child_processes(os.getpid())
