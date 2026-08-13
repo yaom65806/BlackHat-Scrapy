@@ -5,3 +5,5 @@ regex
 psutil
 lxml
 multiprocess
+playwright
+requests
